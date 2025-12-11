@@ -1,3 +1,6 @@
 streamlit
 pandas
-openai-whisper
+openpyxl
+PyMuPDF
+pytesseract
+Pillow

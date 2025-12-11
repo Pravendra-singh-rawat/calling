@@ -1,139 +1,153 @@
 import streamlit as st
 import pandas as pd
+from io import BytesIO
 import tempfile
 import os
-import whisper
+import pytesseract
+from PIL import Image
+import fitz # PyMuPDF library is imported as fitz
+import re # Added for robust text splitting
 
-# --- 1. Load Whisper Model (Run once) ---
-# We load the 'base' model for decent speed and accuracy.
-# This will download the model weights the first time it's run.
-@st.cache_resource
-def load_whisper_model():
-    """Loads the Whisper model into memory."""
-    try:
-        model = whisper.load_model("base")
-        return model
-    except Exception as e:
-        st.error(f"Could not load Whisper model. Ensure you have ffmpeg installed and enough memory. Error: {e}")
+# --- Configure Tesseract Path (For local testing only) ---
+# For deployment, the Tesseract path is handled by the Docker container's PATH variable.
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe' 
+
+
+# --- Configuration and Setup ---
+
+st.set_page_config(
+    page_title="PDF to Excel Converter (PyMuPDF + Tesseract)",
+    layout="centered",
+    initial_sidebar_state="auto",
+)
+
+st.title("📚 PDF to Excel Converter (Tesseract OCR Only)")
+st.markdown("This tool uses **PyMuPDF and Tesseract** to reliably extract **Hindi (OCR)** text from all pages and merge the results.")
+st.caption("Deployment requires a server that supports system packages like Tesseract.")
+
+
+# --- Helper Functions ---
+
+def convert_dfs_to_excel_bytes(dataframes):
+    """
+    Concatenates a list of DataFrames and converts the result into an 
+    in-memory Excel file (bytes) with a single sheet.
+    """
+    if not dataframes:
         return None
 
-# --- 2. Transcription Function ---
-def transcribe_audio_file(model, audio_path):
-    """Transcribes an audio file using the loaded Whisper model."""
     try:
-        # Use a context manager to ensure memory is handled correctly
-        result = model.transcribe(audio_path, fp16=False) # fp16=False recommended for CPU
-        return result["text"]
+        final_df = pd.concat(dataframes, ignore_index=True)
     except Exception as e:
-        st.error(f"Transcription failed for {audio_path}: {e}")
-        return "ERROR: Failed to transcribe."
+        st.error(f"Error concatenating tables: {e}")
+        return None
 
-# --- 3. LLM/Analysis Simulation Function ---
-def analyze_transcript_for_exam_duty(transcript):
+    output = BytesIO()
+    try:
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            final_df.to_excel(writer, sheet_name="Merged_OCR_Result", index=False)
+        output.seek(0)
+        return output.getvalue()
+    except Exception as e:
+        st.error(f"Error during Excel conversion: {e}")
+        return None
+
+
+def extract_text_with_ocr(pdf_path, dpi=300):
     """
-    Simulates the LLM analysis for the 'Exam Duty' conclusion.
-    
-    In a real app, this would be an API call to GPT-4, Gemini, etc., 
-    with a complex prompt. Here, we use simple keyword matching for demo purposes.
+    Uses PyMuPDF to render each page as an image, runs Tesseract OCR for Hindi,
+    and returns a list of DataFrames (one per page).
     """
-    transcript_lower = transcript.lower()
+    extracted_data_blocks = []
     
-    # Check for acceptance keywords
-    if any(keyword in transcript_lower for keyword in ["yes, i can", "i'll do it", "i accept", "sure, i will"]):
-        conclusion = "Accepted"
-        reason = "Agreed to take on the duty."
-    
-    # Check for decline/unclear keywords
-    elif any(keyword in transcript_lower for keyword in ["i can't", "not possible", "already booked", "i'm busy"]):
-        conclusion = "Declined"
+    try:
+        pdf_document = fitz.open(pdf_path)
+        num_pages = pdf_document.page_count
         
-        # Simple rule to extract a reason
-        if "already booked" in transcript_lower:
-            reason = "Declined, citing prior booking."
-        elif "not possible" in transcript_lower:
-            reason = "Declined, stating it's not possible."
-        else:
-            reason = "Declined (Reason unclear from keywords)."
+        st.info(f"PDF has {num_pages} pages. Running OCR on each page... (This will be slow)")
+        
+        for i in range(num_pages):
+            page = pdf_document.load_page(i)
             
-    # Default to pending/unclear
-    else:
-        conclusion = "Unclear/Pending"
-        reason = "The final decision was not clearly stated."
-        
-    return conclusion, reason
-
-# --- 4. Streamlit App Layout ---
-def main():
-    st.title("🎤 Bulk Audio Transcription & Exam Duty Analysis")
-    st.markdown("Upload multiple audio files for automated transcription and conclusion extraction.")
-    
-    # Load model once
-    whisper_model = load_whisper_model()
-    if not whisper_model:
-        return # Stop execution if model failed to load
-
-    # Bulk file uploader
-    uploaded_files = st.file_uploader(
-        "Upload multiple voice recordings (.mp3, .wav)",
-        type=['mp3', 'wav'],
-        accept_multiple_files=True
-    )
-    
-    results_list = []
-    
-    if uploaded_files and st.button("Start Bulk Analysis"):
-        st.info(f"Processing {len(uploaded_files)} files. This will take some time...")
-        
-        # Use a Streamlit progress bar
-        progress_bar = st.progress(0)
-        
-        # Create a temporary directory for file processing
-        with tempfile.TemporaryDirectory() as temp_dir:
+            # Render the page to a high-resolution image (PixMap)
+            pix = page.get_pixmap(matrix=fitz.Matrix(dpi/72, dpi/72))
             
-            for i, uploaded_file in enumerate(uploaded_files):
-                file_name = uploaded_file.name
-                st.write(f"**Processing:** {file_name}")
-                
-                # 1. Save the uploaded file to the temporary directory
-                temp_audio_path = os.path.join(temp_dir, file_name)
-                with open(temp_audio_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                
-                # 2. Transcribe the audio
-                full_transcript = transcribe_audio_file(whisper_model, temp_audio_path)
-                
-                # 3. Analyze the transcript
-                conclusion, reason = analyze_transcript_for_exam_duty(full_transcript)
-                
-                # 4. Store results
-                results_list.append({
-                    "File Name": file_name,
-                    "Conclusion": conclusion,
-                    "Reason/Condition": reason,
-                    "Transcript Snippet": full_transcript[:100] + "..." if len(full_transcript) > 100 else full_transcript
-                })
+            # Convert PixMap to PIL Image
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            
+            # Run Tesseract OCR on the image for Hindi text
+            text = pytesseract.image_to_string(img, lang='hin')
+            
+            lines = text.split('\n')
+            
+            # Use regex to split by 2 or more spaces, which is robust for OCR output
+            page_data = [re.split(r'\s{2,}', line.strip()) for line in lines if line.strip()]
+            
+            # Only proceed if we actually got data lines
+            if page_data:
+                page_df = pd.DataFrame(page_data, columns=None) 
+                extracted_data_blocks.append(page_df)
+            else:
+                st.warning(f"No structured text found on page {i+1}.")
 
-                # Update progress bar
-                progress_bar.progress((i + 1) / len(uploaded_files))
-
-        st.success("Analysis Complete!")
+        st.success("OCR completed on all pages.")
+        return extracted_data_blocks
         
-        # 5. Display the results table
-        st.subheader("✅ Bulk Analysis Results Table")
-        df_results = pd.DataFrame(results_list)
-        
-        # Display the interactive table
-        st.dataframe(df_results, use_container_width=True)
-        
-        # Provide option to download
-        csv = df_results.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Download Results as CSV",
-            data=csv,
-            file_name='audio_analysis_results.csv',
-            mime='text/csv',
-        )
+    except pytesseract.TesseractNotFoundError:
+        st.error("Tesseract Error: Tesseract executable not found.")
+        st.warning("Please ensure **Tesseract** is installed and its path is correct.")
+        return None
+    except Exception as e:
+        st.error(f"An unexpected error occurred during OCR extraction: {e}")
+        return None
 
 
-if __name__ == "__main__":
-    main()
+# --- Streamlit App Logic ---
+
+uploaded_file = st.file_uploader(
+    "Upload a PDF file", 
+    type=["pdf"], 
+    help="Select the PDF containing the data you wish to convert."
+)
+
+if uploaded_file is not None:
+    pdf_path = None
+    dataframes = []
+    try:
+        with st.spinner("Processing file, rendering pages, and running OCR..."):
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                tmp_file.write(uploaded_file.read())
+                pdf_path = tmp_file.name
+
+            dataframes = extract_text_with_ocr(pdf_path)
+            
+            if dataframes and not all(df.empty for df in dataframes):
+                st.success("Successfully processed all pages using OCR!")
+                
+                final_merged_df = pd.concat(dataframes, ignore_index=True)
+                
+                st.subheader("Merged OCR Result Preview")
+                st.dataframe(final_merged_df.head(15))
+
+                excel_bytes = convert_dfs_to_excel_bytes(dataframes) 
+
+                if excel_bytes:
+                    st.subheader("Download Result")
+                    base_filename = os.path.splitext(uploaded_file.name)[0]
+                    st.download_button(
+                        label="📥 Download Single Merged Excel File (.xlsx)",
+                        data=excel_bytes,
+                        file_name=f"{base_filename}_Tesseract_OCR.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                
+            else:
+                st.warning("No structured text was extracted from the PDF pages after OCR.")
+            
+    except Exception as e:
+        st.error(f"An unexpected error occurred during processing: {e}")
+        
+    finally:
+        if pdf_path and os.path.exists(pdf_path):
+             os.unlink(pdf_path)
